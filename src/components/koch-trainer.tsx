@@ -346,7 +346,7 @@ export default function KochMethodTrainer() {
                   onRandomChange={setGrpCntRnd} randomLabel="3 – 8"
                 />
                 <SettingSlider
-                  label={t.settings.wpm} value={charWpm} min={10} max={40}
+                  label={t.settings.wpm} value={charWpm} min={10} max={30}
                   onChange={v => { setCharWpm(v); if (effWpm > v) setEffWpm(v); }}
                 />
                 <SettingSlider
