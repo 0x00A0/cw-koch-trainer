@@ -118,31 +118,48 @@ export default function KochMethodTrainer() {
   // regenerate when lesson changes
   useEffect(() => { generate(); }, [currentLesson]);
 
-  /* Ensure AudioContext is unlocked on user gesture (required by mobile browsers) */
-  const unlockAudio = () => {
+  /**
+   * Ensure AudioContext is created and unlocked.
+   * MUST be called from within a user-gesture handler (click/touch).
+   * Returns the ready-to-use AudioContext.
+   */
+  async function ensureAudioContext(): Promise<AudioContext> {
     if (!ctxRef.current) {
       ctxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
     }
-    if (ctxRef.current.state === "suspended") {
-      ctxRef.current.resume();
-    }
-    // Play a silent buffer to fully unlock on iOS
-    const buf = ctxRef.current.createBuffer(1, 1, 22050);
-    const src = ctxRef.current.createBufferSource();
-    src.buffer = buf;
-    src.connect(ctxRef.current.destination);
-    src.start(0);
-  };
+    const ac = ctxRef.current;
 
-  /* audio */
-  async function getCtx() {
-    if (!ctxRef.current) {
-      ctxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
+    // Resume if suspended (mobile browsers suspend by default)
+    if (ac.state === "suspended") {
+      await ac.resume();
     }
-    if (ctxRef.current.state === "suspended") {
-      await ctxRef.current.resume();
+
+    // Play a silent buffer to fully unlock on iOS / Android WebView.
+    // This must happen synchronously within the gesture handler scope.
+    try {
+      const buf = ac.createBuffer(1, 1, ac.sampleRate);
+      const src = ac.createBufferSource();
+      src.buffer = buf;
+      src.connect(ac.destination);
+      src.start(0);
+    } catch { /* ignore */ }
+
+    // Wait until the context is truly running
+    if (ac.state !== "running") {
+      await new Promise<void>((resolve) => {
+        const onStateChange = () => {
+          if (ac.state === "running") {
+            ac.removeEventListener("statechange", onStateChange);
+            resolve();
+          }
+        };
+        ac.addEventListener("statechange", onStateChange);
+        // Fallback timeout so we don't hang forever
+        setTimeout(resolve, 500);
+      });
     }
-    return ctxRef.current;
+
+    return ac;
   }
 
   /** Create and start simulated HF CW receiver noise:
@@ -200,23 +217,24 @@ export default function KochMethodTrainer() {
       osc.frequency.value = hz;
 
       const vol = Math.max(0, volume / 100) * 0.2;
-      const now = ac.currentTime;
-      const end = now + ms / 1000;
+      // Use a small lookahead to ensure scheduling works on mobile
+      const now = ac.currentTime + 0.005;
+      const dur = ms / 1000;
+      const end = now + dur;
       const ramp = 0.004; // 4ms ramp to avoid click/pop
 
       gain.gain.setValueAtTime(0, now);
       gain.gain.linearRampToValueAtTime(vol, now + ramp);
-      gain.gain.setValueAtTime(vol, end - ramp);
+      gain.gain.setValueAtTime(vol, Math.max(now + ramp, end - ramp));
       gain.gain.linearRampToValueAtTime(0, end);
 
       osc.connect(gain);
       gain.connect(ac.destination);
       osc.start(now);
-      osc.stop(end + 0.01);
+      osc.stop(end + 0.02);
 
-      // resolve after tone finishes (use setTimeout as fallback for Safari)
-      const timeout = setTimeout(() => resolve(), ms);
-      osc.onended = () => { clearTimeout(timeout); resolve(); };
+      // Use setTimeout as the PRIMARY resolution (more reliable on mobile)
+      setTimeout(resolve, ms + 10);
     });
   }
   const gap = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
@@ -257,7 +275,7 @@ export default function KochMethodTrainer() {
   async function playMorse(text: string) {
     if (!text) return;
     stopRef.current = false; setPlaying(true);
-    const ac = await getCtx();
+    const ac = await ensureAudioContext();
 
     // start white noise if enabled
     if (noiseOn) startNoise(ac);
@@ -286,7 +304,7 @@ export default function KochMethodTrainer() {
 
   async function playChar(item: string) {
     stopRef.current = false;
-    const ac = await getCtx();
+    const ac = await ensureAudioContext();
     const d = dotMs(charWpm), da = d * 3, intra = d;
     const charGap = dotMs(effWpm) * 3;
     // item could be a prosign like <AR>, a single char, or a phrase like "CQ"
@@ -416,7 +434,7 @@ export default function KochMethodTrainer() {
                 {/* play / stop / new */}
                 <div className="flex items-center gap-2">
                   <Button
-                    onClick={() => { unlockAudio(); playMorse(seq); }}
+                    onClick={() => { playMorse(seq); }}
                     disabled={playing}
                     className="rounded-lg bg-wf-ok px-5 py-2.5 text-base font-medium text-white hover:bg-wf-ok-hover disabled:opacity-40"
                   >
@@ -499,8 +517,8 @@ export default function KochMethodTrainer() {
           </Card>
 
           {/* ════ lesson card (right side) ════ */}
-          <Card className="flex flex-col rounded-2xl border-wf-border bg-wf-bg-card shadow-wf">
-            <CardContent className="flex flex-1 flex-col p-4">
+          <Card className={`flex flex-col rounded-2xl border-wf-border bg-wf-bg-card shadow-wf transition-opacity ${playing ? "opacity-50" : ""}`}>
+            <CardContent className={`flex flex-1 flex-col p-4 ${playing ? "pointer-events-none" : ""}`}>
               {/* category selector */}
               <div className="mb-3">
                 <div className="mb-1.5 text-sm font-semibold uppercase tracking-wide text-wf-text-dim">
@@ -557,7 +575,7 @@ export default function KochMethodTrainer() {
                         {morseOf(item)}
                       </span>
                       <button
-                        onClick={() => { unlockAudio(); playChar(item); }}
+                        onClick={() => { playChar(item); }}
                         title={`${t.lesson.playChar} ${item}`}
                         className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-wf-bg-deep text-wf-text-muted transition hover:text-wf-text"
                       >
@@ -593,8 +611,8 @@ export default function KochMethodTrainer() {
           </div>
 
           {/* ════ settings card ════ */}
-          <Card className="rounded-2xl border-wf-border bg-wf-bg-card shadow-wf">
-            <CardContent className="p-4 sm:p-5">
+          <Card className={`rounded-2xl border-wf-border bg-wf-bg-card shadow-wf transition-opacity ${playing ? "opacity-50" : ""}`}>
+            <CardContent className={`p-4 sm:p-5 ${playing ? "pointer-events-none" : ""}`}>
               <h2 className="mb-4 text-sm font-semibold uppercase tracking-wide text-wf-text-dim">
                 {t.settings.title}
               </h2>
@@ -605,38 +623,45 @@ export default function KochMethodTrainer() {
                     label={t.settings.groupLength} value={grpLen} min={1} max={8}
                     onChange={setGrpLen} random={grpLenRnd}
                     onRandomChange={setGrpLenRnd} randomLabel="1 – 8"
+                    disabled={playing}
                   />
                 )}
                 <SettingSlider
                   label={t.settings.groups} value={grpCnt} min={4} max={12}
                   onChange={setGrpCnt} random={grpCntRnd}
                   onRandomChange={setGrpCntRnd} randomLabel="4 – 10"
+                  disabled={playing}
                 />
                 <SettingSlider
                   label={t.settings.wpm} value={charWpm} min={12} max={30}
                   onChange={v => { setCharWpm(v); if (effWpm > v) setEffWpm(v); }}
+                  disabled={playing}
                 />
                 <SettingSlider
                   label={t.settings.effectiveSpeed} value={effWpm} min={5} max={charWpm}
                   onChange={setEffWpm} suffix=" WPM"
+                  disabled={playing}
                 />
                 <SettingSlider
                   label={t.settings.toneFreq} value={toneHz} min={400} max={1000} step={10}
                   onChange={setToneHz} suffix=" Hz"
+                  disabled={playing}
                 />
                 <SettingSlider
                   label={t.settings.volume} value={volume} min={0} max={100}
                   onChange={setVolume} suffix="%"
+                  disabled={playing}
                 />
                 <div className="space-y-1.5">
                   <div className="flex items-center justify-between">
                     <Label className="text-sm text-wf-accent">{t.settings.noise}</Label>
-                    <Switch checked={noiseOn} onCheckedChange={setNoiseOn} className="scale-[0.8]" />
+                    <Switch checked={noiseOn} onCheckedChange={setNoiseOn} disabled={playing} className="scale-[0.8]" />
                   </div>
                   {noiseOn ? (
                     <Slider
                       value={[noiseVol]} min={0} max={100} step={1}
                       onValueChange={v => setNoiseVol(v[0])}
+                      disabled={playing}
                       className="[&_[role=slider]]:h-3 [&_[role=slider]]:w-3 [&_[role=slider]]:border-wf-slider-border [&_[role=slider]]:bg-wf-slider-thumb"
                     />
                   ) : (
@@ -671,7 +696,7 @@ export default function KochMethodTrainer() {
 
 function SettingSlider({
   label, value, min, max, step = 1, onChange, suffix = "",
-  random, onRandomChange, randomLabel,
+  random, onRandomChange, randomLabel, disabled,
 }: {
   label: string;
   value: number; min: number; max: number; step?: number;
@@ -680,10 +705,11 @@ function SettingSlider({
   random?: boolean;
   onRandomChange?: (v: boolean) => void;
   randomLabel?: string;
+  disabled?: boolean;
 }) {
   const t = useI18n();
   return (
-    <div className="space-y-1.5">
+    <div className={`space-y-1.5 ${disabled ? "opacity-50" : ""}`}>
       <div className="flex items-center justify-between">
         <Label className="text-sm text-wf-accent">{label}</Label>
         <div className="flex items-center gap-2">
@@ -692,7 +718,7 @@ function SettingSlider({
           )}
           {onRandomChange && (
             <label className="flex cursor-pointer items-center gap-1 text-[10px] uppercase tracking-wider text-wf-text-dim">
-              <Switch checked={random} onCheckedChange={onRandomChange} className="scale-[0.65]" />
+              <Switch checked={random} onCheckedChange={onRandomChange} disabled={disabled} className="scale-[0.65]" />
               {t.settings.rnd}
             </label>
           )}
@@ -706,6 +732,7 @@ function SettingSlider({
         <Slider
           value={[value]} min={min} max={max} step={step}
           onValueChange={v => onChange(v[0])}
+          disabled={disabled}
           className="[&_[role=slider]]:h-3 [&_[role=slider]]:w-3 [&_[role=slider]]:border-wf-slider-border [&_[role=slider]]:bg-wf-slider-thumb"
         />
       )}
